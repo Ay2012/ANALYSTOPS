@@ -317,7 +317,10 @@ def _apply_incomplete_file(
     if transactions.empty:
         raise CorruptionError("Cannot truncate an empty file.")
 
-    remaining_count = max(1, math.floor(len(transactions) * 0.1))
+    remaining_count = min(
+        len(transactions) - 1,
+        max(1, math.floor(len(transactions) * 0.1)),
+    )
     selected = sorted(rng.sample(transactions.index.tolist(), remaining_count))
     corrupted = transactions.loc[selected].reset_index(drop=True)
 

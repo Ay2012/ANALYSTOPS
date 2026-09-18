@@ -7,5 +7,6 @@ data/generated/
 data/manifests/
 data/incoming/
 data/quarantine/
+data/ingestion/
 PHASE_ZERO_BRIEF.md
 AnalystOps_Project_Blueprint.pdf

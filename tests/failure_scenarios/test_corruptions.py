@@ -98,6 +98,26 @@ class CorruptionTests(unittest.TestCase):
         self.assertEqual(sheet_names, ["Transactions", "Lookup"])
         self.assertEqual(result.details["extra_sheets"], ["Lookup"])
 
+    def test_incomplete_file_removes_the_only_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clean_path = Path(tmpdir) / "clean" / "sample.xlsx"
+            write_clean_submission(clean_path)
+            frame = pd.read_excel(clean_path, sheet_name="Transactions").head(1)
+            with pd.ExcelWriter(clean_path, engine="openpyxl") as writer:
+                frame.to_excel(writer, sheet_name="Transactions", index=False)
+
+            result = corrupt_submission(
+                clean_path,
+                scenario="incomplete_file",
+                seed=3,
+                output_dir=Path(tmpdir) / "corrupted",
+            )
+            corrupted = pd.read_excel(result.output_path, sheet_name="Transactions")
+
+        self.assertEqual(result.row_count_before, 1)
+        self.assertEqual(result.row_count_after, 0)
+        self.assertTrue(corrupted.empty)
+
     def test_corrupt_clean_submissions_generates_requested_scenarios(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             clean_path = Path(tmpdir) / "clean" / "sample.xlsx"

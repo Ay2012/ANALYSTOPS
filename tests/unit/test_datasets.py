@@ -8,10 +8,58 @@ import pandas as pd
 
 from tests.helpers import write_source_workbook
 from analystops.datasets.splitter import split_by_country_month
-from analystops.datasets.uci_online_retail import load_source_workbook
+from analystops.datasets.uci_online_retail import SourceWorkbookError, load_source_workbook
 
 
 class DatasetLoaderTests(unittest.TestCase):
+    def test_load_source_workbook_removes_only_validated_cross_sheet_overlap(self) -> None:
+        columns = [
+            "Invoice", "StockCode", "Description", "Quantity", "InvoiceDate",
+            "Price", "Customer ID", "Country",
+        ]
+        outside = ["OLD", "A", "outside", 1, "2010-11-30", 1.0, 1, "UK"]
+        duplicate = ["DUP", "B", "duplicate", 2, "2010-12-01", 2.0, None, "UK"]
+        later = ["NEW", "C", "later", 3, "2010-12-20", 3.0, 2, "UK"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "online_retail_II.xlsx"
+            with pd.ExcelWriter(source_path, engine="openpyxl") as writer:
+                pd.DataFrame([outside, duplicate, duplicate], columns=columns).to_excel(
+                    writer, sheet_name="Year 2009-2010", index=False
+                )
+                pd.DataFrame([duplicate, duplicate, later], columns=columns).to_excel(
+                    writer, sheet_name="Year 2010-2011", index=False
+                )
+
+            first = load_source_workbook(source_path)
+            second = load_source_workbook(source_path)
+
+        pd.testing.assert_frame_equal(first, second)
+        self.assertEqual(first["invoice"].tolist(), ["OLD", "DUP", "DUP", "NEW"])
+        self.assertEqual(first["source_sheet"].tolist()[1:], ["Year 2010-2011"] * 3)
+        self.assertEqual(first["source_row_number"].tolist(), [2, 2, 3, 4])
+
+    def test_load_source_workbook_rejects_inconsistent_overlap(self) -> None:
+        columns = [
+            "Invoice", "StockCode", "Description", "Quantity", "InvoiceDate",
+            "Price", "Customer ID", "Country",
+        ]
+        older = [["A", "A", "old", 1, "2010-12-01", 1.0, 1, "UK"]]
+        newer = [["B", "B", "new", 1, "2010-12-01", 1.0, 1, "UK"]]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "online_retail_II.xlsx"
+            with pd.ExcelWriter(source_path, engine="openpyxl") as writer:
+                pd.DataFrame(older, columns=columns).to_excel(
+                    writer, sheet_name="Year 2009-2010", index=False
+                )
+                pd.DataFrame(newer, columns=columns).to_excel(
+                    writer, sheet_name="Year 2010-2011", index=False
+                )
+
+            with self.assertRaises(SourceWorkbookError):
+                load_source_workbook(source_path)
+
     def test_load_source_workbook_normalizes_both_sheets_and_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source_path = Path(tmpdir) / "online_retail_II.xlsx"

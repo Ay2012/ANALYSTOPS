@@ -1,7 +1,7 @@
 # AnalystOps
 
-AnalystOps is currently in Phase One: deterministic source loading and dataset
-simulation before any AI or agent workflow is added.
+AnalystOps includes deterministic dataset simulation and Bronze workbook intake
+before any AI or agent workflow is added.
 
 ## Phase One Dataset Flow
 
@@ -53,3 +53,29 @@ PYTHONPATH=src python -m analystops.datasets.manifests --seed 42 --max-files 1 -
 ```
 
 Manifests are written under `data/manifests/`.
+
+## Phase Two Bronze Intake
+
+Validate one or more workbooks and write their intake evidence:
+
+```bash
+PYTHONPATH=src python -m analystops.ingestion.validate workbook.xlsx --output-dir data/ingestion/results
+```
+
+For an `AWAITING_REVIEW` workbook, create a fillable review request:
+
+```bash
+PYTHONPATH=src python -m analystops.ingestion.review workbook.xlsx --baseline-row-count 1000
+```
+
+After completing its specific resolutions, reassess the unchanged workbook:
+
+```bash
+PYTHONPATH=src python -m analystops.ingestion.review workbook.xlsx \
+  --baseline-row-count 1000 \
+  --resolution data/ingestion/reviews/workbook_<hash>.review.json \
+  --output-dir data/ingestion/results
+```
+
+Review resolutions are bound to the workbook hash and cannot override quarantine
+findings.

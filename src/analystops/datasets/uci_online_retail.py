@@ -46,6 +46,9 @@ NORMALIZED_COLUMNS = [
     "line_revenue",
 ]
 
+BUSINESS_COLUMNS = list(SOURCE_TO_CANONICAL_COLUMNS.values())
+OVERLAP_MONTH = "2010-12"
+
 
 class SourceWorkbookError(ValueError):
     """Raised when the source workbook does not match the expected contract."""
@@ -97,7 +100,42 @@ def load_source_workbook(
             for sheet_name in sheet_names
         ]
 
+    frames = _remove_source_overlap(frames)
     return pd.concat(frames, ignore_index=True)[NORMALIZED_COLUMNS]
+
+
+def _remove_source_overlap(frames: list[pd.DataFrame]) -> list[pd.DataFrame]:
+    by_sheet = {frame["source_sheet"].iat[0]: frame for frame in frames if not frame.empty}
+    if not all(sheet in by_sheet for sheet in SOURCE_SHEETS):
+        return frames
+
+    older, newer = (by_sheet[sheet] for sheet in SOURCE_SHEETS)
+    older_overlap = older[older["reporting_month"] == OVERLAP_MONTH]
+    newer_overlap = newer[newer["reporting_month"] == OVERLAP_MONTH]
+    if older_overlap.empty or newer_overlap.empty:
+        return frames
+
+    # The newer sheet repeats the older sheet's partial December, then continues it.
+    repeated = newer_overlap["invoice_date"].between(
+        older_overlap["invoice_date"].min(), older_overlap["invoice_date"].max()
+    )
+    if not _same_rows(older_overlap, newer_overlap[repeated]):
+        raise SourceWorkbookError(
+            f"Source sheets contain inconsistent {OVERLAP_MONTH} overlap."
+        )
+
+    trimmed = older[older["reporting_month"] != OVERLAP_MONTH]
+    return [trimmed if frame is older else frame for frame in frames]
+
+
+def _same_rows(left: pd.DataFrame, right: pd.DataFrame) -> bool:
+    def counts(frame: pd.DataFrame) -> pd.DataFrame:
+        return frame.groupby(BUSINESS_COLUMNS, dropna=False).size().reset_index(name="count")
+
+    merged = counts(left).merge(
+        counts(right), on=BUSINESS_COLUMNS, how="outer", suffixes=("_left", "_right")
+    )
+    return merged["count_left"].equals(merged["count_right"])
 
 
 def profile_transactions(transactions: pd.DataFrame) -> WorkbookProfile:

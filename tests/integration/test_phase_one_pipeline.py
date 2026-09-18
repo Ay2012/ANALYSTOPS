@@ -125,6 +125,7 @@ class ManifestTests(unittest.TestCase):
                         manifest["row_count_after"],
                         details["retained_row_count"],
                     )
+                    self.assertEqual(manifest["expected_handling"], "review")
                 elif manifest["scenario"] == "multi_sheet_workbook":
                     self.assertTrue(
                         set(details["extra_sheets"]).issubset(workbook_sheets(workbook))

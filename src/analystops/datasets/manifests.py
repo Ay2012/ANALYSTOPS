@@ -35,12 +35,12 @@ EXPECTED_HANDLING = {
     "currency_strings": "review",
     "date_format_changes": "review",
     "duplicate_rows": "review",
-    "missing_customer_ids": "review",
+    "missing_customer_ids": "accept",
     "missing_required_column": "quarantine",
-    "unexpected_columns": "review",
-    "incomplete_file": "quarantine",
-    "duplicate_prior_month_upload": "quarantine",
-    "multi_sheet_workbook": "review",
+    "unexpected_columns": "accept",
+    "incomplete_file": "review",
+    "duplicate_prior_month_upload": "duplicate",
+    "multi_sheet_workbook": "accept",
 }
 
 
