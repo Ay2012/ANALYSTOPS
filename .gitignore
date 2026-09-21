@@ -8,5 +8,9 @@ data/manifests/
 data/incoming/
 data/quarantine/
 data/ingestion/
+data/silver/
+data/validation/
+data/agents/
+data/workflows/
 PHASE_ZERO_BRIEF.md
 AnalystOps_Project_Blueprint.pdf
