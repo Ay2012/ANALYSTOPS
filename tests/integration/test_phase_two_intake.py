@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 import tempfile
 import unittest
 import zipfile
@@ -15,7 +17,8 @@ from analystops.datasets.manifests import (
     write_corruption_manifest,
 )
 from analystops.datasets.splitter import SubmissionSplit
-from analystops.ingestion.validate import validate_workbook
+from analystops.ingestion.materialize import materialize_corpus
+from analystops.ingestion.validate import read_result, validate_workbook
 
 
 BRONZE_EXPECTED = {
@@ -34,6 +37,46 @@ BRONZE_EXPECTED = {
 
 
 class IntakeValidationTests(unittest.TestCase):
+    def test_materializes_authoritative_corpus_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            clean = root / "generated" / "clean" / "sample.xlsx"
+            duplicate = root / "generated" / "corrupted" / "duplicate.xlsx"
+            manifests = root / "manifests"
+            write_clean_submission(clean)
+            duplicate.parent.mkdir(parents=True)
+            shutil.copyfile(clean, duplicate)
+
+            clean_manifest = manifests / "clean" / "sample.json"
+            duplicate_manifest = manifests / "corrupted" / "duplicate.json"
+            clean_manifest.parent.mkdir(parents=True)
+            duplicate_manifest.parent.mkdir(parents=True)
+            clean_manifest.write_text(json.dumps({"file_path": str(clean)}))
+            duplicate_manifest.write_text(
+                json.dumps(
+                    {
+                        "file_path": str(duplicate),
+                        "source_file_path": str(clean),
+                        "row_count_before": 4,
+                    }
+                )
+            )
+
+            output_dir = root / "results"
+            summary = materialize_corpus(
+                manifests, output_dir=output_dir, workers=1
+            )
+            records = [read_result(path) for path in output_dir.rglob("*.json")]
+
+        self.assertEqual(summary["total"], 2)
+        self.assertEqual(
+            summary["states"], {"BRONZE_ACCEPTED": 1, "DUPLICATE": 1}
+        )
+        self.assertEqual(
+            {record["lifecycle_state"] for record in records},
+            {"BRONZE_ACCEPTED", "DUPLICATE"},
+        )
+
     def test_clean_submission_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "clean.xlsx"

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import re
 import zipfile
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
@@ -19,6 +20,8 @@ from openpyxl.utils import get_column_letter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RESULTS_DIR = PROJECT_ROOT / "data" / "ingestion" / "results"
+BRONZE_POLICY_VERSION = "bronze-v1"
+BRONZE_RECORD_TYPE = "analystops.bronze.intake-result"
 
 EXPECTED_COLUMNS = (
     "Invoice",
@@ -74,6 +77,7 @@ MAX_SHEETS = 50
 MAX_ROWS_PER_SHEET = 1_000_000
 MAX_COLUMNS_PER_SHEET = 1_000
 MAX_REPORTED_LOCATIONS = 20
+MAX_REPORTED_VALUES = 5
 DUPLICATE_REVIEW_RATE = 0.10
 
 
@@ -257,10 +261,61 @@ def validate_workbook(
 
 
 def write_result(result: IntakeResult, output_dir: Path | str = DEFAULT_RESULTS_DIR) -> Path:
-    output_path = Path(output_dir) / f"{Path(result.file_path).stem}.json"
+    identity = result.file_hash or hashlib.sha256(result.file_path.encode()).hexdigest()
+    output_path = (
+        Path(output_dir) / f"{Path(result.file_path).stem}_{identity[:12]}.json"
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n")
+    payload = {
+        **result.to_dict(),
+        "record_type": BRONZE_RECORD_TYPE,
+        "policy_version": BRONZE_POLICY_VERSION,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    payload["record_hash"] = _record_hash(payload)
+    temporary = output_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(output_path)
     return output_path
+
+
+def read_result(path: Path | str) -> dict[str, object]:
+    """Read and verify a persisted Bronze authorization record."""
+
+    try:
+        payload = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read Bronze result {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Bronze result must be a JSON object.")
+    if payload.get("record_type") != BRONZE_RECORD_TYPE:
+        raise ValueError("Bronze result is not an authoritative intake record.")
+    if payload.get("policy_version") != BRONZE_POLICY_VERSION:
+        raise ValueError("Bronze result uses an unsupported policy version.")
+    recorded_at = payload.get("recorded_at")
+    if not isinstance(recorded_at, str):
+        raise ValueError("Bronze result is missing its recording timestamp.")
+    try:
+        timestamp = datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Bronze result has an invalid recording timestamp.") from exc
+    if timestamp.tzinfo is None:
+        raise ValueError("Bronze result recording timestamp must include a timezone.")
+    claimed_hash = payload.get("record_hash")
+    unsigned = dict(payload)
+    unsigned.pop("record_hash", None)
+    if not isinstance(claimed_hash, str) or not hmac.compare_digest(
+        claimed_hash, _record_hash(unsigned)
+    ):
+        raise ValueError("Bronze result record hash mismatch.")
+    return payload
+
+
+def _record_hash(payload: dict[str, object]) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _sheet_candidate(sheet: str, frame: pd.DataFrame) -> dict[str, object]:
@@ -331,23 +386,49 @@ def _type_findings(frame: pd.DataFrame) -> list[dict[str, object]]:
         if column not in frame:
             continue
         parsed = parser(frame[column], errors="coerce")
-        failures = int((frame[column].notna() & parsed.isna()).sum())
+        failure_mask = frame[column].notna() & parsed.isna()
+        failures = int(failure_mask.sum())
         if failures:
-            findings.append(_finding(code, "REVIEW", column=column, count=failures))
+            findings.append(
+                _finding(
+                    code,
+                    "REVIEW",
+                    column=column,
+                    count=failures,
+                    examples=_representative_values(frame.loc[failure_mask, column]),
+                )
+            )
 
     if "InvoiceDate" in frame:
-        slash_dates = int(
-            frame["InvoiceDate"]
-            .dropna()
-            .map(lambda value: isinstance(value, str) and "/" in value)
-            .sum()
+        slash_mask = frame["InvoiceDate"].map(
+            lambda value: isinstance(value, str) and "/" in value
         )
+        slash_dates = int(slash_mask.sum())
         if slash_dates:
             findings.append(
-                _finding("non_iso_date_strings", "REVIEW", column="InvoiceDate", count=slash_dates)
+                _finding(
+                    "non_iso_date_strings",
+                    "REVIEW",
+                    column="InvoiceDate",
+                    count=slash_dates,
+                    examples=_representative_values(
+                        frame.loc[slash_mask, "InvoiceDate"]
+                    ),
+                )
             )
 
     return findings
+
+
+def _representative_values(values: Iterable[object]) -> list[str]:
+    unique = list(dict.fromkeys(str(value)[:100] for value in values))
+    if len(unique) <= MAX_REPORTED_VALUES:
+        return unique
+    last = len(unique) - 1
+    return [
+        unique[round(index * last / (MAX_REPORTED_VALUES - 1))]
+        for index in range(MAX_REPORTED_VALUES)
+    ]
 
 
 def _duplicate_findings(frame: pd.DataFrame) -> list[dict[str, object]]:
@@ -598,6 +679,29 @@ def _matched_fields(columns: Iterable[object]) -> set[str]:
         for field, aliases in FIELD_ALIASES.items()
         if normalized.intersection(aliases)
     }
+
+
+def alias_mapping_candidates(
+    observed_columns: Iterable[object],
+    canonical_columns: Iterable[object],
+) -> dict[str, tuple[str, ...]]:
+    """Return registry-backed source candidates for canonical columns."""
+
+    observed = [(str(column), _normalize_column(column)) for column in observed_columns]
+    candidates = {}
+    for canonical_value in canonical_columns:
+        canonical = str(canonical_value)
+        field = EXPECTED_FIELD.get(canonical)
+        if field is None:
+            continue
+        matches = tuple(
+            source
+            for source, normalized in observed
+            if normalized in FIELD_ALIASES[field]
+        )
+        if matches:
+            candidates[canonical] = matches
+    return candidates
 
 
 def _normalize_column(column: object) -> str:
