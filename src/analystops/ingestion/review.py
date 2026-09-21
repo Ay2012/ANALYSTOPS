@@ -9,24 +9,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from analystops.transformations.operations import APPROVED_OPERATIONS, allowed_operations
+
 from .validate import IntakeResult, _result, validate_workbook, write_result
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_REVIEW_DIR = PROJECT_ROOT / "data" / "ingestion" / "reviews"
-
-REVIEW_ACTIONS = {
-    "ambiguous_transaction_sheets": ("select_sheet",),
-    "renamed_required_columns": ("map_columns",),
-    "quantity_parse_failures": ("confirm_numeric_format",),
-    "price_parse_failures": ("confirm_numeric_format",),
-    "date_parse_failures": ("confirm_date_format",),
-    "non_iso_date_strings": ("confirm_date_format",),
-    "exact_duplicate_rows": ("confirm_valid_duplicates", "deduplicate_in_silver"),
-    "empty_transaction_sheet": ("confirm_zero_activity",),
-    "unexpectedly_low_row_count": ("confirm_expected_volume",),
-    "formula_cells": ("materialize_values_in_silver",),
-}
 
 REVIEW_QUESTIONS = {
     "ambiguous_transaction_sheets": "Which plausible sheet contains the transactions?",
@@ -64,7 +53,7 @@ def write_review_request(
             {
                 "finding": finding,
                 "question": REVIEW_QUESTIONS.get(code, "Resolve this finding."),
-                "allowed_actions": list(REVIEW_ACTIONS.get(code, ())),
+                "allowed_actions": list(allowed_operations(code)),
             }
         )
 
@@ -198,7 +187,15 @@ def _validate_resolution_document(
     if timestamp.tzinfo is None:
         raise ReviewResolutionError("reviewed_at must include a timezone.")
 
-    items = document.get("resolutions")
+    return validate_resolution_items(result, document.get("resolutions"))
+
+
+def validate_resolution_items(
+    result: IntakeResult,
+    items: object,
+) -> dict[str, dict[str, Any]]:
+    """Validate proposed issue-specific actions against current Bronze evidence."""
+
     if not isinstance(items, list):
         raise ReviewResolutionError("resolutions must be a list.")
     review_findings = {
@@ -216,7 +213,7 @@ def _validate_resolution_document(
             raise ReviewResolutionError(f"{code!r} is not an active review finding.")
         if code in validated:
             raise ReviewResolutionError(f"Duplicate resolution for {code!r}.")
-        if action not in REVIEW_ACTIONS.get(code, ()):
+        if action not in allowed_operations(code):
             raise ReviewResolutionError(f"Action {action!r} is not allowed for {code!r}.")
         details = item.get("details", {})
         if not isinstance(details, dict):
@@ -239,6 +236,11 @@ def _validate_action_details(
     finding: dict[str, object],
     result: IntakeResult,
 ) -> None:
+    required = set(APPROVED_OPERATIONS[action].required_parameters)
+    if set(details) != required:
+        raise ReviewResolutionError(
+            f"{action} details must be exactly: {', '.join(sorted(required)) or 'none'}."
+        )
     if action == "map_columns":
         mapping = details.get("mapping")
         if not isinstance(mapping, dict) or not mapping:
@@ -256,10 +258,25 @@ def _validate_action_details(
         }
         if not isinstance(sheet_name, str) or sheet_name not in plausible:
             raise ReviewResolutionError("select_sheet requires a plausible sheet name.")
-    elif action in {"confirm_numeric_format", "confirm_date_format"}:
+    elif action == "confirm_numeric_format":
         value = details.get("format")
-        if not isinstance(value, str) or not value.strip():
-            raise ReviewResolutionError(f"{action} requires a non-empty format.")
+        if value not in {"currency", "number"}:
+            raise ReviewResolutionError(
+                "confirm_numeric_format supports 'currency' or 'number'."
+            )
+    elif action == "confirm_date_format":
+        value = details.get("format")
+        if not isinstance(value, str) or not value:
+            raise ReviewResolutionError(
+                "confirm_date_format requires a Python datetime format."
+            )
+        try:
+            sample = datetime(2001, 2, 3, 4, 5).strftime(value)
+            datetime.strptime(sample, value)
+        except ValueError as exc:
+            raise ReviewResolutionError(
+                "confirm_date_format requires a valid Python datetime format."
+            ) from exc
 
 
 def main(argv: list[str] | None = None) -> int:

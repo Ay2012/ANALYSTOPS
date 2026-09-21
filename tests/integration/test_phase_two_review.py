@@ -19,6 +19,10 @@ from analystops.ingestion.review import (
     write_review_request,
 )
 from analystops.ingestion.validate import validate_workbook
+from analystops.transformations.operations import (
+    APPROVED_OPERATIONS,
+    allowed_operations,
+)
 
 
 def resolution_for(result, resolutions: list[dict[str, object]]) -> dict[str, object]:
@@ -31,6 +35,39 @@ def resolution_for(result, resolutions: list[dict[str, object]]) -> dict[str, ob
 
 
 class ReviewWorkflowTests(unittest.TestCase):
+    def test_approved_operation_registry_defines_review_policy(self) -> None:
+        expected = {
+            "ambiguous_transaction_sheets": ("select_sheet",),
+            "renamed_required_columns": ("map_columns",),
+            "quantity_parse_failures": ("confirm_numeric_format",),
+            "price_parse_failures": ("confirm_numeric_format",),
+            "date_parse_failures": ("confirm_date_format",),
+            "non_iso_date_strings": ("confirm_date_format",),
+            "exact_duplicate_rows": (
+                "confirm_valid_duplicates",
+                "deduplicate_in_silver",
+            ),
+            "empty_transaction_sheet": ("confirm_zero_activity",),
+            "unexpectedly_low_row_count": ("confirm_expected_volume",),
+            "formula_cells": ("materialize_values_in_silver",),
+        }
+
+        self.assertEqual(
+            {code: allowed_operations(code) for code in expected},
+            expected,
+        )
+        self.assertEqual(
+            APPROVED_OPERATIONS["map_columns"].required_parameters,
+            ("mapping",),
+        )
+        self.assertEqual(APPROVED_OPERATIONS["map_columns"].approval, "AUTOMATIC")
+        self.assertTrue(APPROVED_OPERATIONS["map_columns"].executes_in_silver)
+        self.assertEqual(APPROVED_OPERATIONS["deduplicate_in_silver"].risk, "HIGH")
+        self.assertEqual(
+            APPROVED_OPERATIONS["deduplicate_in_silver"].approval,
+            "HUMAN",
+        )
+
     def test_review_cli_persists_the_reassessed_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -66,7 +103,7 @@ class ReviewWorkflowTests(unittest.TestCase):
                         str(output_dir),
                     ]
                 )
-            result_path = output_dir / "low_volume.json"
+            result_path = Path(output.getvalue().strip())
             persisted = read_json(result_path)
 
         self.assertEqual(exit_code, 0)
@@ -180,6 +217,28 @@ class ReviewWorkflowTests(unittest.TestCase):
 
         self.assertEqual(result.lifecycle_state, "BRONZE_ACCEPTED")
         self.assertEqual(result.quality_disposition, "WARN")
+
+    def test_numeric_format_must_match_the_operation_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "currency.xlsx"
+            write_clean_submission(path)
+            frame = pd.read_excel(path, sheet_name="Transactions")
+            frame["Price"] = frame["Price"].map(lambda value: f"${value}")
+            frame.to_excel(path, sheet_name="Transactions", index=False)
+            initial = validate_workbook(path)
+            resolution = resolution_for(
+                initial,
+                [
+                    {
+                        "finding_code": "price_parse_failures",
+                        "action": "confirm_numeric_format",
+                        "details": {"format": "probably-money"},
+                    }
+                ],
+            )
+
+            with self.assertRaisesRegex(ReviewResolutionError, "currency.*number"):
+                reassess_workbook(path, resolution)
 
     def test_human_can_select_between_equally_plausible_sheets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
