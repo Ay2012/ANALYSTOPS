@@ -19,13 +19,14 @@ def prepare_silver(
     rows: list[dict[str, object]],
     *,
     cohort: str = "clean",
+    lineage: dict[str, object] | None = None,
 ) -> tuple[Path, Path]:
     workbook = root / "generated" / cohort / "2011-01" / f"{name}_2011-01.xlsx"
     workbook.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
         pd.DataFrame(rows).to_excel(writer, sheet_name="Transactions", index=False)
     bronze = write_result(
-        validate_workbook(workbook), root / "bronze" / cohort
+        validate_workbook(workbook), root / "bronze" / cohort, lineage=lineage
     )
     silver = canonicalize(bronze, output_dir=root / "silver")
     return bronze, silver
@@ -37,7 +38,7 @@ class SilverValidationTests(unittest.TestCase):
             root = Path(tmpdir)
             valid_rows = [
                 {
-                    "Invoice": 1001,
+                    "Invoice": "CA-1001",
                     "StockCode": "A1",
                     "Description": "Sale",
                     "Quantity": 2,
@@ -89,7 +90,10 @@ class SilverValidationTests(unittest.TestCase):
                     "Country": "France",
                 }
             ]
-            prepare_silver(root, "united_kingdom", valid_rows)
+            lineage = {"schema_contract_id": "contract-1"}
+            prepare_silver(
+                root, "united_kingdom", valid_rows, lineage=lineage
+            )
             prepare_silver(root, "france", review_rows)
             prepare_silver(
                 root, "fixture", valid_rows, cohort="corrupted/unexpected_columns"
@@ -135,6 +139,11 @@ class SilverValidationTests(unittest.TestCase):
         self.assertEqual(united_kingdom["metrics"]["net_revenue"], "2.0")
         self.assertEqual(united_kingdom["metrics"]["return_lines"], 1)
         self.assertEqual(united_kingdom["metrics"]["cancellation_lines"], 1)
+        self.assertEqual(
+            united_kingdom["cancellation_policy"],
+            "c_prefix_and_negative_quantity",
+        )
+        self.assertEqual(united_kingdom["lineage"], lineage)
         self.assertEqual(united_kingdom["metrics"]["zero_value_lines"], 1)
         self.assertEqual(united_kingdom["metrics"]["bad_debt_adjustment_lines"], 1)
         self.assertEqual(

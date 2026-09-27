@@ -197,7 +197,15 @@ def _run_loaded_bronze(
 
     report["current_stage"] = "BRONZE_REASSESSMENT"
     resolved_path = (
-        write_result(reassessed, run_dir / "bronze")
+        write_result(
+            reassessed,
+            run_dir / "bronze",
+            lineage=(
+                bronze.get("lineage")
+                if isinstance(bronze.get("lineage"), Mapping)
+                else None
+            ),
+        )
         if reassessed is not None
         else Path(bronze_result_path)
     )

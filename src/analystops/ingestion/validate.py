@@ -11,7 +11,7 @@ import zipfile
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -260,7 +260,12 @@ def validate_workbook(
     )
 
 
-def write_result(result: IntakeResult, output_dir: Path | str = DEFAULT_RESULTS_DIR) -> Path:
+def write_result(
+    result: IntakeResult,
+    output_dir: Path | str = DEFAULT_RESULTS_DIR,
+    *,
+    lineage: Mapping[str, object] | None = None,
+) -> Path:
     identity = result.file_hash or hashlib.sha256(result.file_path.encode()).hexdigest()
     output_path = (
         Path(output_dir) / f"{Path(result.file_path).stem}_{identity[:12]}.json"
@@ -272,6 +277,8 @@ def write_result(result: IntakeResult, output_dir: Path | str = DEFAULT_RESULTS_
         "policy_version": BRONZE_POLICY_VERSION,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
     }
+    if lineage is not None:
+        payload["lineage"] = dict(lineage)
     payload["record_hash"] = _record_hash(payload)
     temporary = output_path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")

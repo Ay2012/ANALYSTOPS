@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_BRONZE_DIR = PROJECT_ROOT / "data" / "ingestion" / "corpus-results"
 DEFAULT_SILVER_DIR = PROJECT_ROOT / "data" / "silver"
 DEFAULT_VALIDATION_DIR = PROJECT_ROOT / "data" / "validation" / "silver"
-VALIDATION_VERSION = "silver-validation-v2"
+VALIDATION_VERSION = "silver-validation-v3"
 CANONICAL_FIELDS = (
     "invoice_id",
     "product_id",
@@ -246,7 +246,7 @@ def _profile_candidate(record_path: Path, silver_root: Path) -> dict[str, object
             if quantity < 0:
                 metrics["return_lines"] += 1
                 metrics["return_units"] += abs(quantity)
-            if invoice_id.upper().startswith("C"):
+            if quantity < 0 and invoice_id.upper().startswith("C"):
                 metrics["cancellation_lines"] += 1
             business_row = tuple(row[field] for field in CANONICAL_FIELDS[:-2])
             if business_row in business_rows:
@@ -346,6 +346,8 @@ def _profile_candidate(record_path: Path, silver_root: Path) -> dict[str, object
         "bronze_record_path": str(record_path.resolve()),
         "silver_result_path": str(result_path.resolve()),
         "canonical_path": str(accepted_path.resolve()),
+        "lineage": bronze.get("lineage"),
+        "cancellation_policy": "c_prefix_and_negative_quantity",
         "reporting_month": reporting_month,
         "country": country,
         "row_count": row_count,

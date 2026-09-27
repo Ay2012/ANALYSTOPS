@@ -139,7 +139,10 @@ class EndToEndWorkflowTests(unittest.TestCase):
             rows = pd.concat([rows, rows.iloc[[0]]], ignore_index=True)
             with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
                 rows.to_excel(writer, sheet_name="Transactions", index=False)
-            bronze_path = write_result(validate_workbook(workbook), root / "bronze")
+            lineage = {"schema_contract_id": "contract-1"}
+            bronze_path = write_result(
+                validate_workbook(workbook), root / "bronze", lineage=lineage
+            )
             client = FakeClient(
                 {
                     "resolutions": [
@@ -185,6 +188,7 @@ class EndToEndWorkflowTests(unittest.TestCase):
         self.assertEqual(first["status"], "AWAITING_HUMAN_REVIEW")
         self.assertIsNone(first["silver_result_path"])
         self.assertEqual(resumed["status"], "SILVER_PUBLISHABLE")
+        self.assertEqual(profile["lineage"], lineage)
         self.assertEqual(profile["publication_state"], "PUBLISHABLE_WITH_WARNINGS")
         self.assertEqual(
             profile["findings"][0]["review_resolution"],
