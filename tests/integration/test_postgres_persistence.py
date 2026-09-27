@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import tempfile
 import unittest
@@ -20,6 +21,7 @@ from analystops.ingestion.review import reassess_workbook
 from analystops.ingestion.validate import validate_workbook, write_result
 from analystops.persistence.postgres import (
     persist_bronze_result,
+    persist_publication_result,
     persist_workflow_result,
 )
 from analystops.workflows.bronze_to_silver import (
@@ -254,6 +256,83 @@ class PostgresPersistenceTests(unittest.TestCase):
         )
         self.assertEqual(other_operations, (None, []))
 
+    def test_persists_publication_receipt_idempotently(self) -> None:
+        client_id = uuid4()
+        publication_id = uuid4()
+        source_id = "a" * 64
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            canonical = root / "canonical.jsonl"
+            profile = root / "profile.json"
+            canonical.write_text("{}\n")
+            profile.write_text("{}\n")
+            entry = {
+                "source_file_id": source_id,
+                "parent_source_file_id": "b" * 64,
+                "reporting_month": "2026-09",
+                "country": "Canada",
+                "row_count": 1,
+                "canonical_path": str(canonical),
+                "profile_path": str(profile),
+                "canonical_sha256": hashlib.sha256(canonical.read_bytes()).hexdigest(),
+                "profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
+            }
+            manifest = {
+                "manifest_version": "silver-publication-manifest-v1",
+                "updated_at": "2026-09-26T12:00:00+00:00",
+                "published_workbooks": 1,
+                "published_rows": 1,
+                "entries": [entry],
+            }
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest))
+            manifest_hash = hashlib.sha256(
+                json.dumps(
+                    manifest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode()
+            ).hexdigest()
+            receipt = {
+                "publication_version": "silver-publication-v1",
+                "publication_id": str(publication_id),
+                "execution_id": str(publication_id),
+                "status": "PUBLISHED",
+                "published_at": "2026-09-26T12:00:00+00:00",
+                "manifest_path": str(manifest_path),
+                "manifest_hash": manifest_hash,
+                "published_workbooks": 1,
+                "published_rows": 1,
+                "dropped_rows": 0,
+                "entries": [entry],
+            }
+            receipt_path = root / "publication.json"
+            receipt_path.write_text(json.dumps(receipt))
+
+            with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as connection:
+                try:
+                    first = persist_publication_result(
+                        connection,
+                        receipt_path,
+                        client_id=client_id,
+                        client_name="Publication Test Client",
+                    )
+                    second = persist_publication_result(
+                        connection,
+                        receipt_path,
+                        client_id=client_id,
+                        client_name="Publication Test Client",
+                    )
+                    counts = self._publication_counts(connection, client_id)
+                finally:
+                    self._delete_client(connection, client_id)
+
+        self.assertTrue(first.inserted)
+        self.assertEqual(first.items_written, 1)
+        self.assertFalse(second.inserted)
+        self.assertEqual(counts, (1, 1))
+
     @staticmethod
     def _tenant_counts(connection, client_id) -> tuple[int, ...]:
         with connection.transaction():
@@ -347,8 +426,26 @@ class PostgresPersistenceTests(unittest.TestCase):
             return batch_run, batch_items
 
     @staticmethod
+    def _publication_counts(connection, client_id) -> tuple[int, int]:
+        with connection.transaction():
+            connection.execute("SET LOCAL ROLE analystops_app")
+            connection.execute(
+                "SELECT set_config('app.client_id', %s, true)",
+                (str(client_id),),
+            )
+            return connection.execute(
+                """
+                SELECT
+                    (SELECT count(*) FROM analystops.publication_runs),
+                    (SELECT count(*) FROM analystops.publication_items)
+                """
+            ).fetchone()
+
+    @staticmethod
     def _delete_client(connection, client_id) -> None:
         for table in (
+            "publication_items",
+            "publication_runs",
             "batch_items",
             "batch_runs",
             "workflow_runs",

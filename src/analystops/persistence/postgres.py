@@ -57,6 +57,15 @@ class PersistedBatchRun:
     items_written: int
 
 
+@dataclass(frozen=True)
+class PersistedPublicationRun:
+    client_id: UUID
+    publication_run_id: UUID
+    execution_id: UUID
+    inserted: bool
+    items_written: int
+
+
 def persist_bronze_result(
     connection: Connection,
     result_path: Path | str,
@@ -489,6 +498,141 @@ def persist_batch_result(
             )
 
     return PersistedBatchRun(tenant_id, batch_id, status, len(items))
+
+
+def persist_publication_result(
+    connection: Connection,
+    receipt_path: Path | str,
+    *,
+    client_id: UUID | str,
+    client_name: str,
+) -> PersistedPublicationRun:
+    """Persist one verified publication receipt idempotently per tenant."""
+
+    tenant_id = UUID(str(client_id))
+    if not client_name.strip():
+        raise ValueError("client_name must be non-empty.")
+    receipt = _read_document(receipt_path)
+    publication_id = UUID(_required_text(receipt, "publication_id"))
+    execution_id = UUID(_required_text(receipt, "execution_id"))
+    if publication_id != execution_id or receipt.get("status") != "PUBLISHED":
+        raise ValueError("Publication receipt identity or status is invalid.")
+    entries = receipt.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Publication receipt has no entries.")
+    if not all(isinstance(item, dict) for item in entries):
+        raise ValueError("Publication entries must be objects.")
+    if _positive_int(receipt, "published_workbooks") != len(entries):
+        raise ValueError("Publication workbook count does not match its entries.")
+    if _nonnegative_int(receipt, "published_rows") != sum(
+        _nonnegative_int(item, "row_count")
+        for item in entries
+    ):
+        raise ValueError("Publication row count does not match its entries.")
+    manifest_path = Path(_required_text(receipt, "manifest_path"))
+    manifest = _read_document(manifest_path)
+    manifest_entries = manifest.get("entries")
+    if not isinstance(manifest_entries, list) or not all(
+        isinstance(item, dict) for item in manifest_entries
+    ):
+        raise ValueError("Publication manifest entries are malformed.")
+    by_source = {
+        _required_text(item, "source_file_id"): item for item in manifest_entries
+    }
+    for entry in entries:
+        current = by_source.get(_required_text(entry, "source_file_id"))
+        identity_keys = (
+            "canonical_path",
+            "profile_path",
+            "reporting_month",
+            "country",
+            "row_count",
+        )
+        if current is None or any(
+            current.get(key) != entry.get(key) for key in identity_keys
+        ):
+            raise ValueError("Published entry is missing or changed in the manifest.")
+    manifest_hash = _required_text(receipt, "manifest_hash")
+
+    with connection.transaction():
+        connection.execute("SET LOCAL ROLE analystops_app")
+        connection.execute(
+            "SELECT set_config('app.client_id', %s, true)", (str(tenant_id),)
+        )
+        connection.execute(
+            """
+            INSERT INTO analystops.clients (id, name)
+            VALUES (%s, %s)
+            ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+            """,
+            (tenant_id, client_name.strip()),
+        )
+        connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (str(publication_id),),
+        )
+        existing = connection.execute(
+            """
+            SELECT execution_id FROM analystops.publication_runs
+            WHERE client_id = %s AND id = %s
+            """,
+            (tenant_id, publication_id),
+        ).fetchone()
+        if existing:
+            if existing[0] != execution_id:
+                raise ValueError("Existing publication has a conflicting execution.")
+            return PersistedPublicationRun(
+                tenant_id, publication_id, execution_id, False, 0
+            )
+        connection.execute(
+            """
+            INSERT INTO analystops.publication_runs (
+                id, client_id, execution_id, publication_version, status,
+                published_workbooks, published_rows, dropped_rows,
+                manifest_uri, manifest_hash, receipt, published_at
+            ) VALUES (%s, %s, %s, %s, 'PUBLISHED', %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                publication_id,
+                tenant_id,
+                execution_id,
+                _required_text(receipt, "publication_version"),
+                len(entries),
+                _nonnegative_int(receipt, "published_rows"),
+                _nonnegative_int(receipt, "dropped_rows"),
+                manifest_path.resolve().as_uri(),
+                manifest_hash,
+                Jsonb(receipt),
+                _required_text(receipt, "published_at"),
+            ),
+        )
+        for entry in entries:
+            connection.execute(
+                """
+                INSERT INTO analystops.publication_items (
+                    client_id, publication_run_id, source_file_id,
+                    parent_source_file_id, reporting_month, country, row_count,
+                    canonical_artifact_uri, profile_uri, canonical_hash,
+                    profile_hash
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    tenant_id,
+                    publication_id,
+                    _required_text(entry, "source_file_id"),
+                    _required_text(entry, "parent_source_file_id"),
+                    _required_text(entry, "reporting_month"),
+                    _required_text(entry, "country"),
+                    _nonnegative_int(entry, "row_count"),
+                    Path(_required_text(entry, "canonical_path")).resolve().as_uri(),
+                    Path(_required_text(entry, "profile_path")).resolve().as_uri(),
+                    _required_text(entry, "canonical_sha256"),
+                    _required_text(entry, "profile_sha256"),
+                ),
+            )
+    return PersistedPublicationRun(
+        tenant_id, publication_id, execution_id, True, len(entries)
+    )
 
 
 def _persist_agent_run(
