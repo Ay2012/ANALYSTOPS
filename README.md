@@ -3,6 +3,9 @@
 AnalystOps includes deterministic dataset simulation and Bronze workbook intake
 before any AI or agent workflow is added.
 
+Measured architecture, evaluation, cost, failure, human-review, and PostgreSQL
+evidence is collected in [the engineering evidence record](docs/engineering_evidence.md).
+
 ## Phase One Dataset Flow
 
 The first implemented slice reads the UCI Online Retail II source workbook and
@@ -107,6 +110,119 @@ bounded `gpt-5.6-terra` escalation, and writes token usage with the proposal
 under `data/agents/proposals/`. Model output is checked against the approved
 operation registry. Automatic findings are only labeled; this command never
 changes a workbook or approves a human-only operation.
+
+## Silver Remediation Agent
+
+For a persisted `REVIEW_REQUIRED` Silver validation profile, request a bounded
+diagnosis and human-approved remediation proposal:
+
+```bash
+PYTHONPATH=src python -m analystops.agents.silver_remediation \
+  data/validation/silver/profiles/<source-file-id>.json
+```
+
+The proposal is written under `data/agents/silver-proposals/` with model
+attempts, token usage, latency, and a hash of the assessed validation profile.
+It can only select a finding-specific registered action or defer; it never
+changes canonical data or publishes a workbook.
+
+Run the same boundary as a persisted LangGraph workflow:
+
+```bash
+set -a; source .env; set +a
+PYTHONPATH=src python -m analystops.workflows.silver_remediation_graph start \
+  data/validation/silver/profiles/<source-file-id>.json
+```
+
+The audit prints its thread ID and pauses at a durable human interrupt. Resume
+that thread in a later process after reviewing the proposed actions:
+
+```bash
+PYTHONPATH=src python -m analystops.workflows.silver_remediation_graph resume \
+  <thread-id> --decision APPROVE --reviewed-by <reviewer>
+```
+
+`APPROVE` runs the registered deterministic executor, creates country-month
+child submissions, reruns Bronze and Silver validation, and requires exact row
+reconciliation. Successful children stop at `READY_FOR_PUBLICATION`; this
+workflow does not add them to a publication manifest. The default SQLite
+checkpointer is for local operation. Production PostgreSQL checkpointing
+requires a separate tenant-isolation and retention policy.
+
+If execution is interrupted by a process failure, retry the checkpointed node
+without replaying approval or calling the model:
+
+```bash
+PYTHONPATH=src python -m analystops.workflows.silver_remediation_graph retry \
+  <thread-id>
+```
+
+Repartitioning can expose a high duplicate rate inside a small child. The graph
+then pauses again for an explicit `CONFIRM_VALID_DUPLICATES`, `DEDUPLICATE`, or
+`REJECT` decision using the same `resume` command.
+
+Publish a completed `READY_FOR_PUBLICATION` execution through the atomic gate:
+
+```bash
+PYTHONPATH=src python -m analystops.workflows.silver_publication \
+  data/silver/remediation/<execution-id>/execution.json \
+  --client-id 00000000-0000-0000-0000-000000000001 \
+  --client-name "Meridian Retail Group"
+```
+
+The gate hashes and rechecks every canonical artifact and profile, verifies row
+reconciliation, atomically updates `data/publication/silver/manifest.json`, and
+writes an idempotent `publication.json` receipt. PostgreSQL persistence can be
+retried from that receipt without republishing files.
+
+## Schema Onboarding Agent
+
+For a readable external workbook quarantined only because required fields are
+missing or renamed, draft client-specific mappings and targeted BA questions:
+
+```bash
+PYTHONPATH=src python -m analystops.agents.schema_onboarding \
+  data/ingestion/external-shadow/<bronze-record>.json
+```
+
+The proposal under `data/agents/schema-onboarding/` contains a fillable
+`context_template`. Save the completed template separately, then request a
+revised draft with:
+
+```bash
+PYTHONPATH=src python -m analystops.agents.schema_onboarding \
+  data/ingestion/external-shadow/<bronze-record>.json \
+  --prior-proposal data/agents/schema-onboarding/<proposal>.json \
+  --context data/agents/schema-onboarding/<context>.json
+```
+
+All mappings and derivations remain non-executable and require human approval.
+Security, unreadable-file, and active-content quarantines never reach this
+agent. An approved deterministic adapter and Bronze re-entry are intentionally
+separate from the onboarding proposal.
+
+Generate the explicit approval artifact for a proposal that has reached
+`READY_FOR_HUMAN_REVIEW`:
+
+```bash
+PYTHONPATH=src python -m analystops.workflows.schema_onboarding \
+  approval-template <bronze-record.json> <proposal.onboarding.json> \
+  --client-id <client-id>
+```
+
+After a data owner fills the reviewer, timezone-aware review timestamp, and
+changes every intended decision from `PENDING` to `APPROVE`, compile the
+contract, adapt a staging copy, and rerun Bronze with:
+
+```bash
+PYTHONPATH=src python -m analystops.workflows.schema_onboarding \
+  execute <bronze-record.json> <proposal.onboarding.json> <approval.json>
+```
+
+The executor verifies the original file hash and schema, supports only the
+registered `divide_columns` derivation with `on_zero: BLOCK`, and never modifies
+the uploaded workbook. It writes one country-month workbook and Bronze record
+per partition; each record carries the approved contract and source lineage.
 
 ## Agent Evaluation and Observability
 
@@ -241,8 +357,9 @@ docker compose up -d postgres
 
 PostgreSQL stores clients, workbook identities, Bronze evidence, review
 resolutions, agent attempts and token usage, transformation plans, Silver run
-metadata, validation profiles, workflow audits, and batch operations. Workbook
-and canonical data files remain external artifacts referenced by URI.
+metadata, validation profiles, workflow audits, batch operations, and
+publication receipts. Workbook and canonical data files remain external
+artifacts referenced by URI.
 
 For an existing local database, apply each new migration once:
 
@@ -253,6 +370,8 @@ docker compose exec -T postgres psql -U analystops -d analystops \
   -f /docker-entrypoint-initdb.d/003_failure_durability.sql
 docker compose exec -T postgres psql -U analystops -d analystops \
   -f /docker-entrypoint-initdb.d/004_batch_operations.sql
+docker compose exec -T postgres psql -U analystops -d analystops \
+  -f /docker-entrypoint-initdb.d/005_silver_publication.sql
 ```
 
 Verify the schema and row-level tenant isolation:
