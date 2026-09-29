@@ -131,7 +131,8 @@ Run the same boundary as a persisted LangGraph workflow:
 ```bash
 set -a; source .env; set +a
 PYTHONPATH=src python -m analystops.workflows.silver_remediation_graph start \
-  data/validation/silver/profiles/<source-file-id>.json
+  data/validation/silver/profiles/<source-file-id>.json \
+  --client-id <client-uuid>
 ```
 
 The audit prints its thread ID and pauses at a durable human interrupt. Resume
@@ -139,27 +140,84 @@ that thread in a later process after reviewing the proposed actions:
 
 ```bash
 PYTHONPATH=src python -m analystops.workflows.silver_remediation_graph resume \
-  <thread-id> --decision APPROVE --reviewed-by <reviewer>
+  <thread-id> --decision APPROVE --reviewed-by <reviewer> \
+  --client-id <client-uuid>
 ```
 
 `APPROVE` runs the registered deterministic executor, creates country-month
 child submissions, reruns Bronze and Silver validation, and requires exact row
 reconciliation. Successful children stop at `READY_FOR_PUBLICATION`; this
-workflow does not add them to a publication manifest. The default SQLite
-checkpointer is for local operation. Production PostgreSQL checkpointing
-requires a separate tenant-isolation and retention policy.
+workflow does not add them to a publication manifest. PostgreSQL retains the
+LangGraph checkpoints across process restarts. The client UUID is incorporated
+into the stored thread key so equal public thread UUIDs cannot collide across
+tenants. Set `CHECKPOINT_DATABASE_URL` to override the local Compose database.
 
 If execution is interrupted by a process failure, retry the checkpointed node
 without replaying approval or calling the model:
 
 ```bash
 PYTHONPATH=src python -m analystops.workflows.silver_remediation_graph retry \
-  <thread-id>
+  <thread-id> --client-id <client-uuid>
 ```
 
 Repartitioning can expose a high duplicate rate inside a small child. The graph
 then pauses again for an explicit `CONFIRM_VALID_DUPLICATES`, `DEDUPLICATE`, or
 `REJECT` decision using the same `resume` command.
+
+## Human Review API
+
+Configure one or more local reviewer tokens in `.env`. Each opaque token maps to
+the tenant and reviewer identity that the server will use; neither value is
+accepted from an HTTP request:
+
+```bash
+.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
+```dotenv
+ANALYSTOPS_REVIEW_TOKENS='{"<generated-token>":{"client_id":"a599f9da-35b3-5ada-89c4-67ff449294d6","reviewed_by":"ayushgaur"}}'
+```
+
+Start the local API:
+
+```bash
+set -a; source .env; set +a
+PYTHONPATH=src .venv/bin/python -m analystops.api.human_review
+```
+
+Open `http://127.0.0.1:8000/docs` for the interactive API, or list pending
+reviews directly:
+
+```bash
+curl -H "Authorization: Bearer <generated-token>" \
+  http://127.0.0.1:8000/v1/reviews
+```
+
+The API supports pending-review listing, tenant-scoped evidence inspection, and
+registered Silver decisions. Reviewer identity comes from authentication,
+competing decisions are serialized with a PostgreSQL advisory lock, and every
+successful decision writes the same workflow audit as the CLI. The environment
+token registry is a local bootstrap mechanism; a deployed service should verify
+tokens issued by an external identity provider.
+
+## Checkpoint Retention And Recovery
+
+Preview the tenant-scoped 30-day retention policy:
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  -m analystops.workflows.checkpoint_retention \
+  --client-id <client-uuid> \
+  --retention-days 30
+```
+
+The command is dry-run by default and writes a JSON decision report under
+`data/operations/checkpoint-retention/`. It never deletes pending, active,
+retryable, unknown, recent, or audit-missing workflows. After reviewing the
+report, repeat with `--apply` to delete only eligible terminal checkpoints.
+
+See [the operations runbook](docs/operations_runbook.md) for health checks,
+failure recovery, backup boundaries, and the verified recovery drill.
 
 Publish a completed `READY_FOR_PUBLICATION` execution through the atomic gate:
 
@@ -346,6 +404,64 @@ Retryable workflow failures run again on resume. Database-only failures retry
 the existing workflow audit without repeating model or Silver work. The command
 returns status `2` when the batch completes with failures.
 
+## Gold Analytics
+
+Build or incrementally refresh one tenant's local analytical database from the
+authoritative Silver publication manifest:
+
+```bash
+PYTHONPATH=src python -m analystops.gold \
+  --client-id 00000000-0000-0000-0000-000000000001 \
+  --client-name "Meridian Retail Group"
+```
+
+The command writes tenant-scoped analytical tables to PostgreSQL. It verifies
+published artifact hashes when supplied, canonical row counts, lineage, and
+Silver net-revenue and gross-sales totals before committing. Changed rows are
+streamed through a temporary staging table, unchanged inputs are skipped,
+removed publications are deleted, and a failed refresh preserves the last
+successful facts. PostgreSQL row-level security isolates every Gold table.
+
+The database exposes `fact_sales_line`, `gold_order`, `gold_monthly_sales`,
+`gold_product_monthly`, `gold_customer_monthly`, and `gold_status`. Revenue is
+`quantity * unit_price`; returns remain negative in net revenue, gross sales
+include positive-quantity sales, and recognized bad-debt or unrecognized
+negative-price adjustments are excluded. Discounts and profit are unavailable
+because the canonical Silver contract does not contain those fields.
+
+The retained corpus verification loaded 679 publication items and 1,055,041
+facts, produced 58,739 orders, 78,321 product-month rows, and 31,685
+customer-month rows, and completed an unchanged rerun without reloading facts.
+
+## Metabase Dashboard
+
+Start PostgreSQL, apply the Gold migration, build Gold, then start the
+self-hosted Metabase Open Source service:
+
+```bash
+docker compose up -d postgres
+docker compose exec -T postgres psql -U analystops -d analystops \
+  -f /docker-entrypoint-initdb.d/006_gold_analytics.sql
+PYTHONPATH=src python -m analystops.gold \
+  --client-id 00000000-0000-0000-0000-000000000001 \
+  --client-name "Meridian Retail Group"
+docker compose up -d metabase
+```
+
+Open `http://127.0.0.1:3000`, complete the one-time administrator setup, and
+add a PostgreSQL database using host `postgres`, port `5432`, database
+`analystops`, username `analystops_bi`, and password `analystops_bi_dev`.
+The local BI role is read-only and its PostgreSQL session default is pinned to
+the demo tenant through the same row-level security policy used by the loader.
+
+Build dashboard cards from `gold_status`, `gold_monthly_sales`,
+`gold_product_monthly`, and `gold_customer_monthly`. Metabase stores its local
+questions and dashboards in the `analystops-metabase` Docker volume. Its local
+H2 application database is appropriate for the portfolio environment; deploy
+Metabase with its own PostgreSQL application database and secret-managed BI
+credentials before treating the dashboard service as production.
+Set `METABASE_PORT` or `METABASE_TIMEZONE` to override the local defaults.
+
 ## PostgreSQL Control Plane
 
 Start the local metadata database:
@@ -372,6 +488,8 @@ docker compose exec -T postgres psql -U analystops -d analystops \
   -f /docker-entrypoint-initdb.d/004_batch_operations.sql
 docker compose exec -T postgres psql -U analystops -d analystops \
   -f /docker-entrypoint-initdb.d/005_silver_publication.sql
+docker compose exec -T postgres psql -U analystops -d analystops \
+  -f /docker-entrypoint-initdb.d/006_gold_analytics.sql
 ```
 
 Verify the schema and row-level tenant isolation:

@@ -20,8 +20,10 @@ claim remains traceable and defensible.
 | Human control | Agent deferred an ambiguous duplicate; a human approved a hash-bound Silver operation | [Agent proposal](../data/workflows/bronze-to-silver/ad2b9157-3ca3-4916-95a0-1bcd7619b66d/agent-proposal.json), [approved workflow](../data/workflows/bronze-to-silver/8575678a-b4d1-42b0-959a-9f9eeaac30ea/workflow.json) |
 | Production batch | 85 of 85 workflows completed as Silver publishable with zero failures | [PostgreSQL-backed batch](../data/workflows/batches/a3acf338-e8ae-4c99-bd9b-08c80b574275/batch.json) |
 | Silver publication | Atomic gate published 85 canonical workbooks and 10,193 rows; PostgreSQL retained one publication run and 85 lineage items | [Publication receipt](../data/silver/remediation/ffff29a9-48cc-4b82-802d-ac5f4d974712/publication.json), [database verification](../data/publication/silver/postgres-verification.json) |
+| Human review API | Bearer-authenticated, tenant-derived review listing, evidence inspection, and allowlisted decisions over durable LangGraph state | [API implementation](../src/analystops/api/human_review.py), [PostgreSQL API test](../tests/integration/test_human_review_api.py) |
+| Checkpoint lifecycle | Tenant-scoped dry-run/apply retention protects pending and retryable work and deletes only aged, audited terminal checkpoints | [Retention implementation](../src/analystops/workflows/checkpoint_retention.py), [recovery runbook](operations_runbook.md) |
 | Tenant isolation | Correct tenant saw 85 workbooks, Bronze runs, workflows, Silver runs, and batch items; another tenant saw zero | [PostgreSQL verification](../data/workflows/batches/a3acf338-e8ae-4c99-bd9b-08c80b574275/postgres-verification.json) |
-| Automated tests | 96 tests passed with PostgreSQL enabled; zero failures, errors, or skips | [Test suite](../tests) |
+| Automated tests | 103 tests passed with PostgreSQL enabled; zero failures, errors, or skips | [Test suite](../tests) |
 
 ## Architecture
 
@@ -45,7 +47,8 @@ flowchart LR
     V -->|PASS or WARN| G[Atomic publication gate]
     V -->|REVIEW| SR[Silver remediation agent]
     V -->|BLOCK| HOLD[Held from publication]
-    SR --> LG[Persisted LangGraph human interrupt]
+    SR --> API[Authenticated human review API]
+    API --> LG[Persisted LangGraph human interrupt]
     LG -->|approved registered action| EX[Deterministic remediation executor]
     LG -->|rejected| HOLD
     EX --> B
@@ -55,6 +58,7 @@ flowchart LR
     S --> PG
     V --> PG
     PUB --> PG
+    PG --> RET[Audited checkpoint retention]
 ```
 
 PostgreSQL stores operational metadata, evidence, decisions, and lineage. Raw
@@ -79,6 +83,8 @@ The trust boundaries are:
 5. Silver executes only the authorized deterministic plan and reconciles input,
    accepted, rejected, and dropped rows before publication.
 6. PostgreSQL row-level security scopes operational records by `client_id`.
+7. The review API derives tenant and reviewer identity from authentication,
+   allowlists decisions, and serializes competing writes per workflow thread.
 
 Primary implementation:
 
@@ -91,6 +97,9 @@ Primary implementation:
 - [Silver validation](../src/analystops/validation/silver.py)
 - [Silver remediation agent](../src/analystops/agents/silver_remediation.py)
 - [Persisted remediation graph](../src/analystops/workflows/silver_remediation_graph.py)
+- [Human review API](../src/analystops/api/human_review.py)
+- [Checkpoint retention](../src/analystops/workflows/checkpoint_retention.py)
+- [Operations runbook](operations_runbook.md)
 - [Silver publication gate](../src/analystops/workflows/silver_publication.py)
 - [Batch orchestration](../src/analystops/workflows/batch_bronze_to_silver.py)
 - [PostgreSQL persistence](../src/analystops/persistence/postgres.py)
@@ -229,6 +238,40 @@ Evidence:
 - [Successful deferred proposal](../data/workflows/bronze-to-silver/ad2b9157-3ca3-4916-95a0-1bcd7619b66d/agent-proposal.json)
 - [Human-approved rerun](../data/workflows/bronze-to-silver/8575678a-b4d1-42b0-959a-9f9eeaac30ea/workflow.json)
 
+## PostgreSQL Checkpoint Durability
+
+The Silver LangGraph CLI now uses the native PostgreSQL checkpointer with
+restricted checkpoint deserialization. Persisted thread keys combine
+`client_id` and the public workflow thread UUID, preventing equal thread UUIDs
+from colliding across tenants while keeping the public ID stable in audits.
+
+The PostgreSQL integration test interrupted a review workflow, closed the
+database connection, opened a new connection, and resumed a human rejection.
+The same public thread ID returned no state under a different client ID, and
+the fake model recorded exactly one call across interruption and resume. The
+full CLI also completed a no-model checkpoint smoke test and emitted a
+tenant-scoped `silver-remediation-graph-v3` audit.
+
+The authenticated review API was then exercised against the same PostgreSQL
+checkpointer. The correct tenant listed and inspected its pending interrupt; a
+second tenant received an empty list and a scoped 404 for the same public thread
+UUID. An authenticated rejection recorded the server-derived reviewer identity,
+wrote the workflow audit, and rejected a repeated decision with HTTP 409. The
+model was called once across the full interrupt and API-resume lifecycle.
+
+`checkpoint-retention-v1` adds a tenant-scoped lifecycle policy. Dry-run is the
+default; pending interrupts, active or retryable nodes, unknown statuses,
+recent terminal threads, and audit-missing threads are protected. Apply mode
+uses the same per-thread PostgreSQL advisory lock as review decisions and
+deletes only aged, audited terminal checkpoint writes, blobs, and snapshots.
+
+The retained production dry-run scanned zero threads and deleted zero because
+all temporary verification checkpoints had already been cleaned. The dedicated
+integration test supplied the destructive evidence: one audited terminal
+thread was eligible and deleted, one pending review was preserved, and another
+tenant's terminal thread was untouched. The six-test recovery drill completed
+in 0.446 seconds.
+
 ## PostgreSQL Evidence
 
 The final batch used tenant UUID
@@ -261,14 +304,29 @@ TEST_DATABASE_URL=postgresql://... \
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests
 ```
 
-Result on 2026-09-26: 96 tests run in 1.411 seconds; 96 passed, 0 failed,
+Result on 2026-09-28: 104 tests run in 1.866 seconds; 104 passed, 0 failed,
 0 errored, and 0 skipped.
 
 Coverage includes deterministic intake, review authorization, transformation
 plans, Silver canonicalization and validation, both remediation agents,
 schema onboarding, LangGraph interruption and resume behavior, publication
 integrity and idempotency, failure durability, batch resume behavior,
-PostgreSQL persistence, and tenant isolation.
+PostgreSQL persistence, authenticated review, checkpoint retention, recovery,
+and tenant isolation.
+
+## Gold Analytical Evidence
+
+The PostgreSQL Gold loader consumed only the authoritative publication
+manifest. A full local verification reconciled 679 publication profiles and
+1,055,041 canonical rows, producing 58,739 order rows, 679 country-month rows,
+78,321 product-month rows, and 31,685 customer-month rows. An immediate rerun
+reported zero changed items and loaded zero rows.
+
+The focused Gold regression covers hash and profile validation, exact financial
+reconciliation, idempotency, database-enforced client isolation, semantic
+views, successful and no-op run audits, failed-run audit, and rollback of
+invalid input. On 2026-09-28, the complete PostgreSQL-enabled suite ran 104
+tests in 1.866 seconds with no failures, errors, or skips.
 
 ## Resume-Ready Claims
 
@@ -290,12 +348,23 @@ Use measured, scoped wording:
 - Implemented a persisted LangGraph Silver-remediation workflow with bounded
   model proposals, two human approval interrupts, deterministic execution,
   resumability, and an idempotent publication gate.
+- Exposed human decisions through a bearer-authenticated FastAPI boundary that
+  derives tenant and reviewer identity, prevents cross-tenant thread access,
+  allowlists actions, and serializes concurrent decisions in PostgreSQL.
+- Implemented tenant-scoped checkpoint lifecycle management with dry-run
+  evidence, terminal-state and audit gates, advisory-locked cleanup, and a
+  tested restart and recovery runbook.
+- Built an incremental, tenant-scoped PostgreSQL Gold layer over 1,055,041
+  published Silver rows with streaming staging loads, row-level security,
+  reconciled financial metrics, lineage, sales marts, and auditable runs.
 
 Avoid claiming:
 
 - Millions of production workbooks or real customer traffic.
 - A production-deployed LangGraph service; the retained workflow runs locally
-  and uses a SQLite checkpointer.
+  against PostgreSQL rather than as a hosted service.
+- Enterprise SSO or production identity-provider integration; local evidence
+  uses an environment-configured opaque-token registry.
 - Perfect model accuracy outside the measured five-scenario evaluation.
 - PostgreSQL as the analytical warehouse; it currently serves as the metadata
   and operational control plane.
@@ -344,13 +413,18 @@ transformation, and publication remain deterministic Python boundaries.
   tenant.
 - Dollar cost is not claimed because the retained evidence records tokens, not
   a reconciled provider invoice and time-stable pricing snapshot.
-- LangGraph checkpointing is local SQLite rather than tenant-scoped PostgreSQL.
-- Human review is exposed through the CLI, not an authenticated review API.
-- No Gold analytical model or production object-store integration exists yet.
+- Native LangGraph checkpoint tables are isolated through tenant-composed keys
+  and the authenticated service boundary, not PostgreSQL row-level policies.
+- Local API authentication uses opaque environment-configured tokens rather
+  than externally issued, rotated OIDC access tokens.
+- Gold runs in PostgreSQL and Metabase OSS is available locally; scheduled
+  refresh, production dashboard identity, and object-store integration remain.
 
-The next justified implementation is production hardening: tenant-scoped
-PostgreSQL checkpointing and an authenticated review boundary. Gold analytical
-models can follow once the operational workflow is closed cleanly.
+Gold V1 is complete for local analytical consumption. A dashboard and scheduled
+refresh are the next product phases. External identity-provider integration,
+off-host backups, object storage, and measured recovery objectives remain
+deployment requirements and must be completed before making production-service
+claims.
 
 ## Evidence Index
 
@@ -369,3 +443,8 @@ models can follow once the operational workflow is closed cleanly.
 - [Silver publication receipt](../data/silver/remediation/ffff29a9-48cc-4b82-802d-ac5f4d974712/publication.json)
 - [Authoritative Silver manifest](../data/publication/silver/manifest.json)
 - [Publication PostgreSQL verification](../data/publication/silver/postgres-verification.json)
+- [Checkpoint retention dry-run](../data/operations/checkpoint-retention/20260927T230046Z_17ece54e-58d8-4946-81cc-58ea2dfaf186.json)
+- [Checkpoint retention integration test](../tests/integration/test_checkpoint_retention.py)
+- [Workflow operations runbook](operations_runbook.md)
+- [Gold loader](../src/analystops/gold.py)
+- [Gold integration test](../tests/integration/test_gold_phase_one.py)
