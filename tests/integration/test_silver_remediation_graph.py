@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pandas as pd
+import psycopg
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
@@ -22,8 +24,14 @@ from analystops.workflows.silver_publication import (
     publish_silver_execution,
 )
 from analystops.workflows.silver_remediation_graph import (
+    _require_checkpoint,
     build_silver_remediation_graph,
+    checkpoint_config,
+    postgres_checkpointer,
 )
+
+
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
 
 class FakeResponses:
@@ -70,12 +78,19 @@ class FakeClient:
 def write_profile(path: Path, publication_state: str) -> None:
     findings = []
     if publication_state == "REVIEW_REQUIRED":
-        findings.append(
-            {
-                "code": "reporting_month_mismatch",
-                "quality_disposition": "REVIEW",
-                "order_months": ["2026-07", "2026-08"],
-            }
+        findings.extend(
+            [
+                {
+                    "code": "inconsistent_countries",
+                    "quality_disposition": "REVIEW",
+                    "countries": ["France", "Germany"],
+                },
+                {
+                    "code": "reporting_month_mismatch",
+                    "quality_disposition": "REVIEW",
+                    "order_months": ["2026-07", "2026-08"],
+                },
+            ]
         )
     path.write_text(
         json.dumps(
@@ -293,6 +308,61 @@ class SilverRemediationGraphTests(unittest.TestCase):
         self.assertEqual(result["status"], "SILVER_PUBLISHABLE")
         self.assertNotIn("proposal", result)
         self.assertNotIn("__interrupt__", result)
+
+
+@unittest.skipUnless(TEST_DATABASE_URL, "TEST_DATABASE_URL is not configured")
+class PostgresSilverRemediationGraphTests(unittest.TestCase):
+    def test_restart_resume_and_tenant_key_isolation(self) -> None:
+        thread_id = str(uuid4())
+        client_id = str(uuid4())
+        other_client_id = str(uuid4())
+        config = checkpoint_config(thread_id, client_id)
+        other_config = checkpoint_config(thread_id, other_client_id)
+        storage_thread_id = str(config["configurable"]["thread_id"])
+        client = FakeClient()
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                profile_path = Path(tmpdir) / "profile.json"
+                write_profile(profile_path, "REVIEW_REQUIRED")
+                with postgres_checkpointer(TEST_DATABASE_URL) as checkpointer:
+                    interrupted = build_silver_remediation_graph(
+                        client,
+                        checkpointer=checkpointer,
+                    ).invoke({"profile_path": str(profile_path)}, config=config)
+
+                with postgres_checkpointer(TEST_DATABASE_URL) as checkpointer:
+                    graph = build_silver_remediation_graph(
+                        None,
+                        checkpointer=checkpointer,
+                    )
+                    self.assertFalse(graph.get_state(other_config).values)
+                    with self.assertRaisesRegex(ValueError, "No checkpoint found"):
+                        _require_checkpoint(graph, other_config)
+                    resumed = graph.invoke(
+                        Command(
+                            resume={
+                                "decision": "REJECT",
+                                "reviewed_by": "analyst@example.com",
+                            }
+                        ),
+                        config=config,
+                    )
+        finally:
+            with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as connection:
+                for table in (
+                    "checkpoint_writes",
+                    "checkpoint_blobs",
+                    "checkpoints",
+                ):
+                    connection.execute(
+                        f"DELETE FROM analystops.{table} WHERE thread_id = %s",
+                        (storage_thread_id,),
+                    )
+
+        self.assertEqual(interrupted["status"], "AWAITING_HUMAN_REVIEW")
+        self.assertEqual(resumed["status"], "REMEDIATION_REJECTED")
+        self.assertEqual(client.responses.calls, 1)
 
 
 if __name__ == "__main__":

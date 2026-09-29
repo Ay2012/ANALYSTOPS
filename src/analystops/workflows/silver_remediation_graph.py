@@ -5,15 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sqlite3
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Iterator, TypedDict
 from uuid import UUID, uuid4
 
-from langgraph.checkpoint.sqlite import SqliteSaver
+import psycopg
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
+from psycopg.rows import dict_row
 
 from analystops.agents.silver_remediation import (
     ESCALATION_MODEL,
@@ -22,6 +25,7 @@ from analystops.agents.silver_remediation import (
     PRIMARY_MODEL,
     propose_silver_remediation,
 )
+from analystops.persistence.postgres import DEFAULT_DATABASE_URL
 from analystops.workflows.silver_remediation import (
     DEFAULT_REMEDIATION_DIR,
     SilverRemediationError,
@@ -33,8 +37,7 @@ from analystops.workflows.silver_remediation import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_WORKFLOW_DIR = PROJECT_ROOT / "data" / "workflows" / "silver-remediation"
-DEFAULT_CHECKPOINT_DB = DEFAULT_WORKFLOW_DIR / "checkpoints.sqlite"
-WORKFLOW_VERSION = "silver-remediation-graph-v2"
+WORKFLOW_VERSION = "silver-remediation-graph-v3"
 
 
 class SilverGraphState(TypedDict, total=False):
@@ -214,9 +217,13 @@ def build_silver_remediation_graph(
     return builder.compile(checkpointer=checkpointer)
 
 
-def _write_audit(graph: Any, config: dict[str, object], output_dir: Path) -> Path:
+def write_workflow_audit(
+    graph: Any, config: dict[str, object], output_dir: Path
+) -> Path:
     snapshot = graph.get_state(config)
-    thread_id = str(config["configurable"]["thread_id"])
+    configurable = config["configurable"]
+    thread_id = str(configurable["workflow_thread_id"])
+    client_id = str(configurable["client_id"])
     interrupts = [
         item.value
         for task in snapshot.tasks
@@ -225,12 +232,13 @@ def _write_audit(graph: Any, config: dict[str, object], output_dir: Path) -> Pat
     audit = {
         "workflow_version": WORKFLOW_VERSION,
         "thread_id": thread_id,
+        "client_id": client_id,
         "updated_at": datetime.now(UTC).isoformat(),
         "next": list(snapshot.next),
         "interrupts": interrupts,
         **snapshot.values,
     }
-    path = output_dir / thread_id / "workflow.json"
+    path = output_dir / client_id / thread_id / "workflow.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n")
@@ -245,11 +253,71 @@ def _thread_id(value: str) -> str:
         raise argparse.ArgumentTypeError("thread id must be a UUID") from exc
 
 
+def _client_id(value: str) -> str:
+    try:
+        return str(UUID(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("client id must be a UUID") from exc
+
+
+def checkpoint_config(thread_id: str, client_id: str) -> dict[str, object]:
+    """Bind a public workflow thread to one tenant-scoped storage key."""
+
+    workflow_thread_id = _thread_id(thread_id)
+    tenant_id = _client_id(client_id)
+    return {
+        "configurable": {
+            "thread_id": f"{tenant_id}:{workflow_thread_id}",
+            "checkpoint_ns": "",
+            "workflow_thread_id": workflow_thread_id,
+            "client_id": tenant_id,
+        }
+    }
+
+
+@contextmanager
+def postgres_checkpointer(database_url: str) -> Iterator[PostgresSaver]:
+    """Open the durable checkpointer with restricted deserialization."""
+
+    serializer = JsonPlusSerializer(allowed_msgpack_modules=())
+    with psycopg.connect(
+        database_url,
+        autocommit=True,
+        prepare_threshold=0,
+        row_factory=dict_row,
+    ) as connection:
+        checkpointer = PostgresSaver(connection, serde=serializer)
+        checkpointer.setup()
+        yield checkpointer
+
+
+@contextmanager
+def checkpoint_lock(database_url: str, storage_thread_id: str) -> Iterator[None]:
+    """Serialize state changes and retention for one persisted thread."""
+
+    with psycopg.connect(database_url) as connection:
+        with connection.transaction():
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (storage_thread_id,),
+            )
+            yield
+
+
+def _add_checkpoint_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--client-id", type=_client_id, required=True)
+    command.add_argument("--database-url")
+
+
+def _require_checkpoint(graph: Any, config: dict[str, object]) -> None:
+    if not graph.get_state(config).values:
+        raise ValueError("No checkpoint found for this client and thread.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run or resume persisted Silver remediation approval."
     )
-    parser.add_argument("--checkpoint-db", type=Path, default=DEFAULT_CHECKPOINT_DB)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_WORKFLOW_DIR)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -260,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--escalation-model", default=ESCALATION_MODEL)
     start.add_argument("--primary-attempts", type=int, default=PRIMARY_ATTEMPTS)
     start.add_argument("--max-output-tokens", type=int, default=MAX_OUTPUT_TOKENS)
+    _add_checkpoint_arguments(start)
 
     resume = subparsers.add_parser("resume")
     resume.add_argument("thread_id", type=_thread_id)
@@ -274,63 +343,86 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
     )
     resume.add_argument("--reviewed-by", required=True)
+    _add_checkpoint_arguments(resume)
     retry = subparsers.add_parser("retry")
     retry.add_argument("thread_id", type=_thread_id)
+    _add_checkpoint_arguments(retry)
     args = parser.parse_args(argv)
 
-    args.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(args.checkpoint_db, check_same_thread=False)
+    database_url = (
+        args.database_url
+        or os.environ.get("CHECKPOINT_DATABASE_URL")
+        or os.environ.get("DATABASE_URL")
+        or DEFAULT_DATABASE_URL
+    )
     try:
-        checkpointer = SqliteSaver(connection)
-        if args.command == "start":
-            profile = json.loads(args.silver_profile.read_text())
-            needs_agent = (
-                isinstance(profile, dict)
-                and profile.get("publication_state") == "REVIEW_REQUIRED"
-            )
-            if needs_agent and not os.environ.get("OPENAI_API_KEY"):
-                parser.error(
-                    "OPENAI_API_KEY is not exported; run "
-                    "`set -a; source .env; set +a` first"
+        with postgres_checkpointer(database_url) as checkpointer:
+            if args.command == "start":
+                profile = json.loads(args.silver_profile.read_text())
+                needs_agent = (
+                    isinstance(profile, dict)
+                    and profile.get("publication_state") == "REVIEW_REQUIRED"
                 )
-            client = None
-            if needs_agent:
-                from openai import OpenAI
+                if needs_agent and not os.environ.get("OPENAI_API_KEY"):
+                    parser.error(
+                        "OPENAI_API_KEY is not exported; run "
+                        "`set -a; source .env; set +a` first"
+                    )
+                client = None
+                if needs_agent:
+                    from openai import OpenAI
 
-                client = OpenAI()
-            graph = build_silver_remediation_graph(
-                client,
-                checkpointer=checkpointer,
-                primary_model=args.primary_model,
-                escalation_model=args.escalation_model,
-                primary_attempts=args.primary_attempts,
-                max_output_tokens=args.max_output_tokens,
-            )
-            config = {"configurable": {"thread_id": args.thread_id}}
-            graph.invoke(
-                {"profile_path": str(args.silver_profile.resolve())}, config=config
-            )
-        elif args.command == "resume":
-            graph = build_silver_remediation_graph(None, checkpointer=checkpointer)
-            config = {"configurable": {"thread_id": args.thread_id}}
-            graph.invoke(
-                Command(
-                    resume={
-                        "decision": args.decision,
-                        "reviewed_by": args.reviewed_by,
-                    }
-                ),
-                config=config,
-            )
-        else:
-            graph = build_silver_remediation_graph(None, checkpointer=checkpointer)
-            config = {"configurable": {"thread_id": args.thread_id}}
-            graph.invoke(None, config=config)
-        print(_write_audit(graph, config, args.output_dir))
-    except (OSError, json.JSONDecodeError, ValueError, SilverRemediationError) as exc:
+                    client = OpenAI()
+                graph = build_silver_remediation_graph(
+                    client,
+                    checkpointer=checkpointer,
+                    primary_model=args.primary_model,
+                    escalation_model=args.escalation_model,
+                    primary_attempts=args.primary_attempts,
+                    max_output_tokens=args.max_output_tokens,
+                )
+                config = checkpoint_config(args.thread_id, args.client_id)
+                storage_thread_id = str(config["configurable"]["thread_id"])
+                with checkpoint_lock(database_url, storage_thread_id):
+                    if graph.get_state(config).values:
+                        raise ValueError(
+                            "Checkpoint already exists for this client and thread."
+                        )
+                    graph.invoke(
+                        {"profile_path": str(args.silver_profile.resolve())},
+                        config=config,
+                    )
+            elif args.command == "resume":
+                graph = build_silver_remediation_graph(None, checkpointer=checkpointer)
+                config = checkpoint_config(args.thread_id, args.client_id)
+                storage_thread_id = str(config["configurable"]["thread_id"])
+                with checkpoint_lock(database_url, storage_thread_id):
+                    _require_checkpoint(graph, config)
+                    graph.invoke(
+                        Command(
+                            resume={
+                                "decision": args.decision,
+                                "reviewed_by": args.reviewed_by,
+                            }
+                        ),
+                        config=config,
+                    )
+            else:
+                graph = build_silver_remediation_graph(None, checkpointer=checkpointer)
+                config = checkpoint_config(args.thread_id, args.client_id)
+                storage_thread_id = str(config["configurable"]["thread_id"])
+                with checkpoint_lock(database_url, storage_thread_id):
+                    _require_checkpoint(graph, config)
+                    graph.invoke(None, config=config)
+            print(write_workflow_audit(graph, config, args.output_dir))
+    except (
+        OSError,
+        json.JSONDecodeError,
+        psycopg.Error,
+        ValueError,
+        SilverRemediationError,
+    ) as exc:
         parser.exit(1, f"silver graph failed: {exc}\n")
-    finally:
-        connection.close()
     return 0
 
 
