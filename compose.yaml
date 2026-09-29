@@ -16,5 +16,25 @@ services:
       timeout: 5s
       retries: 15
 
+  metabase:
+    image: metabase/metabase:v0.63.17.x
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MB_DB_FILE: /metabase-data/metabase.db
+      MB_SITE_NAME: AnalystOps
+      JAVA_TIMEZONE: ${METABASE_TIMEZONE:-America/New_York}
+    ports:
+      - "127.0.0.1:${METABASE_PORT:-3000}:3000"
+    volumes:
+      - analystops-metabase:/metabase-data
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:3000/api/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
 volumes:
   analystops-postgres:
+  analystops-metabase:
